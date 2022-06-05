@@ -1,0 +1,194 @@
+* 诺基亚-容器云平台部署
+
+** 授权 k8s 客户端
+#+begin_src sh
+  # 创建 Bearea Token 
+  kubectl create serviceaccount -n kube-system paas
+  kubectl create token -n kube-system paas
+  #kubectl create token paas -n kube-system --duration 5184000m -o json
+
+
+  # 验证用户合法性
+  APISERVER=$(kubectl config view -o jsonpath='{.clusters[].cluster.server}')
+  curl -H "Authorization: Bearer $TOKEN" $APISERVER/api --insecure
+
+  # 授权
+  kubectl create clusterrolebinding paas --clusterrole=cluster-admin --serviceaccount=kube-system:paas
+
+  # 验证用户权限
+  ...
+#+end_src
+
+** 准备 mariadb 数据库
+注意：修改数据库信息时需要重启 msgs-server 组件使其生效
+#+begin_src sh
+  # 安装 mariadb
+  yum install mariadb-server
+
+  # 导入数据
+  tar -xvf mysql.tar.gz -C /var/lib/
+
+  # 启动服务
+  systemctl start mariadb
+
+  # 检查访问
+  mysql -uroot -p'root!@#123'
+
+  # 修改容器云平台访问 kubernetes 集群信息（使用 prometheus 获取指标）
+  mysql -uroot -p'root!@#123' \
+	msgs -e "REPLACE INTO msgs.msgs_paas VALUES (1, 1, '192.167.42.63', '浪潮集中性能分析系统', 'https://[2409:8057:5a06:2:0:6:0:142]:8443', '$TOKEN', NULL, NULL, 0, 'monitoring', 'prometheus-kube-prometheus-prometheus:9090')"
+
+  # 修改容器云平台访问 kubernetes 集群信息（使用 influxdb 获取指标）
+  mysql -uroot -p'root!@#123' msgs -e "REPLACE INTO msgs.msgs_paas VALUES (1, 1, '192.167.42.63', '浪潮集中性能分析系统', 'https://[2409:8057:5a06:2:0:6:0:142]:8443', '$TOKEN', NULL, NULL, 1, 'kube-system', 'monitoring-influxdb:8086')"
+#+end_src
+
+** 准备存储在 gitlab 的配置
+涉及的组件，注意修改配置后重启 message config 生效
+- message auth
+- message gateway
+- message monitor
+- message server(token)
+
+#+begin_src sh
+  # 获取存储在 gitlab 的配置文件
+  git config --global http.sslVerify false
+  git clone https://192.167.42.27:10443/msgs/documents.git # fountain fountain
+
+  # 配置组件
+  cp msgs-auth-dev.yaml msgs-auth-langchao.yaml
+  cp msgs-gateway-dev.yaml msgs-gateway-langchao.yaml
+  cp msgs-monitor-dev.yaml msgs-monitor-langchao.yaml
+  cp msgs-server-dev.yaml msgs-server-langchao.yaml
+
+  # 修改数据库连接地址
+  sed  's/192.167.42.27:3306/192.167.42.63:3306/' -i *langchao.yaml
+
+  # 修改 consul.host
+  sed 's/10.68.66.100/10.96.66.100/' -i *langchao.yaml
+
+  # 修改 message server 连接 apiserver 地址和 token (paas.uri, paas.token)
+  # 修改 message server 连接 monitor 地址(paas.monitorUrl)
+
+  # 推送更改
+  git add .
+  git commit -m "add project langchao cluster config"
+  git push
+
+#+end_src
+
+** 部署容器云平台
+- 微服务组件如 message server、message config 正常启动后，consul 才能跟踪服务信息（才会向 consul 注册）
+- 不支持修改 namespace
+*** 创建命名空间
+#+begin_src sh
+  kubectl create -f 00-msgs-namespace.yaml
+#+end_src
+
+*** message consul
+- 检查预定义的 clusterip 是否冲突
+- 留意连接的 gitlab/document 以及各组件配置的 consul 地址
+- message server 启动后可以通过 ui 查看组件状态
+#+begin_src sh
+  kubectl create -f 01-msgs-consul.yaml
+#+end_src
+
+*** message config
+- 留意配置镜像仓库地址
+- 留意配置 hostPath 中 gitlab 的证书
+#+begin_src sh
+  mkdir /usr/local/etc/paas/
+  cp gitlab.cer $_
+
+  kubectl create -f 02-msgs-config.yaml
+#+end_src
+
+*** message server/message gateway
+- 留意 message config cluster ip 
+- 留意 profile 对应的名称（与 gitlab 后缀相关）
+- devops server 配置了 application.yml 指定了数据库地址，apiserver 地址的 token，ui 代理地址，consul 地址
+- 留意预定义的 cluster ip
+#+begin_src sh
+  kubectl create -f 10-msgs-server.yaml
+
+  cp gateway.paas.gdmcc.com.jks /usr/local/etc/paas
+  kubectl create -f 11-msgs-gateway.yaml
+
+  kubectl create -f 12-msgs-auth.yaml
+  kubectl create -f 13-msgs-tracer.yaml
+  kubectl create -f 14-msgs-monitor.yaml
+  kubectl create -f 15-msgs-devops-server.yaml
+#+end_src
+
+*** message ui
+- 注意 message config /message server 正常启动后 consul 才能看到服务注册信息
+- 启动后检查界面"请选择环境选项"是否正常(否则检查个组件是否正常，正常后可能不用重启 ui）
+**** 配置 nginx 代理
+#+begin_src sh
+  cp snippets /etc/nginx
+  cp nginx-selftsigned.crt /etc/ssl/certs
+  cp nginx.conf /etc/nginx/nginx.conf
+
+  mkdir /etc/ssl/private
+  cp nginx-selfsigned.key $_
+
+  cp dhparam.pem /etc/ssl/certs/
+
+  vi /etc/nginx/nginc.conf # 修改 servcer_name
+
+  systemctl restart nginx
+#+end_src
+**** 启动 message ui 程序
+#+begin_src sh
+  # 配置 paas ui
+  vim cfg/application.properties
+
+  -- nokia.nginx.addr=...（网官网地址）
+  -- nokia.devops.serve.baseurl=...（k8s msgs/devops-server service)
+  -- spring.datasource.url=...（数据库）
+
+  # 启动服务
+  yum install java
+  service_cmd.sh start
+#+end_src
+** 迁移集群数据
+#+begin_src sh
+  # 导出命名空间下资源
+  ./export.sh
+
+  # 在新集群创建 serviceaccount 以访问镜像仓库
+  kubectl -n pov-langchao-jtlxtj-pro create secret docker-registry harbor-guest --docker-server=192.167.42.27 --docker-username=admin --docker-password=Harbor12345
+  kubectl -n pov-langchao-jtlxtj-pro create serviceaccount harbor-guest
+  kubectl -n pov-langchao-jtlxtj-pro patch serviceaccount harbor-guest -p '{"imagePullSecrets": [{"name": "harbor-guest"}]}'
+
+  # 新集群创建持久化存储（区分元原有环境）
+  sed 's@/paas_tenant_data/pov-langchao-jtlxtj@/paas_tenant_data/pov-langchao-jtlxtj1@' -i pv-pvc.yaml
+  mkdir $(grep 'path:' pv-pvc.yaml  | awk '{print "/cephfs"$2}') | xargs -n1 -i sudo mkdir -p {} ....
+
+  # 新集群创建持久化存储密钥（删除 claimRef 字段）
+  grep 'secretRef:' pv-pvc.yaml -A1
+  kubectl create -f paas-tenant-dat1.yaml 
+
+  # 如果修改 apiVersion
+  sed 's@extensions/v1beta1@apps/v1@g' -i ...
+
+  # 新集群创建资源
+  kubectl create -f namespace.yaml
+  kubectl create -f 00-resourcequota.yaml
+  kubectl create -f 01-horizontalpodautoscaler.yaml
+  kubectl create -f 02-configmap.yaml
+  kubectl create -f 03-service.yaml
+  kubectl create -f 04-deployment.yaml
+
+#+end_src
+完成后测试界面功能
+
+* 诺基亚-容器云平台修改数据库端口
+
+** 涉及组件
+- 修改并推送 gitlab 的组件配置，涉及 auth、gateway 以及 server 程序
+- 修改 devopsserver configmap 组件的配置，涉及 devop-server 程序
+- 按照顺序重启
+  1. msgs-config，config 需要确保正常才能往下操作
+  2. auth/gateway/server/devops
+- 修改 ui 配置，重启 ui。
+
